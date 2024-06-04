@@ -8,148 +8,170 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * 单线程基本处理器，I/O 的读写以及业务的处理均由 Reactor 线程完成
- * 
- * @see Reactor
+ *
  * @author tongwu.net
+ * @see Reactor
  */
 public class BasicHandler implements Runnable {
-	private static final int MAXIN = 1024;
-	private static final int MAXOUT = 1024;
-	
-	
-	public SocketChannel socket;
-	public SelectionKey sk;
-	ByteBuffer input = ByteBuffer.allocate(MAXIN);
-	ByteBuffer output = ByteBuffer.allocate(MAXOUT);
-	
-	// 定义服务的逻辑状态
-	static final int READING = 0, SENDING = 1, CLOSED = 2;
-	int state = READING;
-	
-	public BasicHandler(Selector sel, SocketChannel sc) throws IOException {
-		socket = sc;
-		sc.configureBlocking(false); // 设置非阻塞
-		// Optionally try first read now
-		sk = socket.register(sel, 0); // 注册通道
-		sk.interestOps(SelectionKey.OP_READ); // 绑定要处理的事件
-		sk.attach(this); // 管理事件的处理程序
-		
-		sel.wakeup(); // 唤醒 select() 方法
-	}
-	
-	public BasicHandler(SocketChannel sc){
-		socket = sc;
-	}
-	
-	@Override
-	public void run() {
-		try {
-			if (state == READING)
-				read(); // 此时通道已经准备好读取字节
-			else if (state == SENDING)
-				send(); // 此时通道已经准备好写入字节
-		} catch (IOException ex) {
-			// 关闭连接
-			try {
-				sk.channel().close();
-			} catch (IOException ignore) {
-			}
-		}
-	}
-	
-	/**
-	 * 从通道读取字节
-	 */
-	protected void read() throws IOException {
-		input.clear(); // 清空接收缓冲区
-		int n = socket.read(input);
-		if (inputIsComplete(n)) {// 如果读取了完整的数据
-			process();
-			// 待发送的数据已经放入发送缓冲区中
-			
-			// 更改服务的逻辑状态以及要处理的事件类型
-			sk.interestOps(SelectionKey.OP_WRITE);
-		}
-	}
-	
-	// 缓存每次读取的内容
-	StringBuilder request = new StringBuilder();
-	/**
-	 * 当读取到 \r\n 时表示结束
-	 * @param bytes 读取的字节数，-1 通常是连接被关闭，0 非阻塞模式可能返回
-	 * @throws IOException
-	 */
-	protected boolean inputIsComplete(int bytes) throws IOException {
-		if (bytes > 0) {
-			input.flip(); // 切换成读取模式
-			while (input.hasRemaining()) {
-				byte ch = input.get();
-				
-				if (ch == 3) { // ctrl+c 关闭连接
-					state = CLOSED;
-					return true;
-				} else if (ch == '\r') { // continue
-				} else if (ch == '\n') {
-					// 读取到了 \r\n 读取结束
-					state = SENDING;
-					return true;
-				} else {
-					request.append((char)ch);
-				}
-			}
-		} else if (bytes == -1) {
-			// -1 客户端关闭了连接
-			throw new EOFException();
-		} else {} // bytes == 0 继续读取
-		return false;
-	}
-	
-	/**
-	 * 根据业务处理结果，判断如何响应
-	 * @throws EOFException 用户输入 ctrl+c 主动关闭
-	 */
-	protected void process() throws EOFException {
-		if (state == CLOSED) {
-			throw new EOFException();
-		} else if (state == SENDING) {
-			String requestContent = request.toString(); // 请求内容
-			byte[] response = requestContent.getBytes(StandardCharsets.UTF_8);
-			output.put(response);
-		}
-	}
-	
-	protected void send() throws IOException {
-		int written = -1;
-		output.flip();// 切换到读取模式，判断是否有数据要发送
-		if (output.hasRemaining()) {
-			written = socket.write(output);
-		}
-		
-		// 检查连接是否处理完毕，是否断开连接
-		if (outputIsComplete(written)) {
-			sk.channel().close();
-		} else {
-			// 否则继续读取
-			state = READING;
-			// 把提示发到界面
-			socket.write(ByteBuffer.wrap("\r\nreactor> ".getBytes()));
-			sk.interestOps(SelectionKey.OP_READ);
-		}
-			
-	}
+    private static final int MAX_INPUT_BUFFER_SIZE = 1024;
 
-	/**
-	 * 当用户输入了一个空行，表示连接可以关闭了
-	 */
-	protected boolean outputIsComplete(int written) {
-		if (written <= 0) {
-			// 用户只敲了个回车， 断开连接
-			return true;	
-		}
-		
-		// 清空旧数据，接着处理后续的请求
-		output.clear();
-		request.delete(0, request.length());
-		return false;
-	}
+    private static final int MAX_OUTPUT_BUFFER_SIZE = 1024;
+
+    public SocketChannel socket;
+
+    public SelectionKey selectionKey;
+
+    ByteBuffer input = ByteBuffer.allocate(MAX_INPUT_BUFFER_SIZE);
+
+    ByteBuffer output = ByteBuffer.allocate(MAX_OUTPUT_BUFFER_SIZE);
+
+    // 定义服务的逻辑状态
+    static final int READING = 0, SENDING = 1, CLOSED = 2;
+
+    int state = READING;
+
+    /**
+     * 缓存每次读取的内容
+     */
+    StringBuilder inputStringBuilder = new StringBuilder();
+
+    public BasicHandler(Selector sel, SocketChannel sc) throws IOException {
+        socket = sc;
+        sc.configureBlocking(false); // 设置非阻塞
+        // Optionally try first read now
+        selectionKey = socket.register(sel, 0); // 注册通道
+        selectionKey.attach(this); // 管理事件的处理程序
+        selectionKey.interestOps(SelectionKey.OP_READ); // 绑定要处理的事件
+
+        sel.wakeup(); // 唤醒 select() 方法
+    }
+
+    public BasicHandler(SocketChannel sc) {
+        socket = sc;
+    }
+
+    @Override
+    public void run() {
+        try {
+            if (state == READING) {
+                // 此时通道已经准备好读取数据
+                read();
+            } else if (state == SENDING) {
+                // 此时通道已经准备好写入数据
+                send();
+            }
+        } catch (IOException ex) {
+            // 关闭连接
+            try {
+                selectionKey.channel().close();
+            } catch (IOException ignore) {
+            }
+        }
+    }
+
+    /**
+     * 从通道读取字节
+     */
+    protected void read() throws IOException {
+        // 清空 input buffer
+        input.clear();
+        // 读取内容到接收 input buffer
+        int n = socket.read(input);
+        // 判断用户是否输入完成
+        if (inputIsComplete(n)) {
+            // 用户输入完成，进行处理，将用户输入放入 output buffer
+            process();
+            // 修改 Handler 状态为响应
+            state = SENDING;
+            // 修改 channel select 的事件类型
+            // Normally also do first write now
+            selectionKey.interestOps(SelectionKey.OP_WRITE);
+        }
+    }
+
+    /**
+     * 当读取到 \r\n 时表示结束，切换到响应状态
+     *
+     * @param bytes 读取的字节数，-1：到达了流的末尾，连接已经关闭；0：当前没有可用数据，连接仍打开，通常在非阻塞模式下返回；> 0：读取的字节数
+     * @throws IOException
+     */
+    protected boolean inputIsComplete(int bytes) throws IOException {
+        if (bytes > 0) {
+            // 将 ByteBuffer 切换成读取模式
+            input.flip();
+            // 每次读取一个字符，添加到 inputStringBuilder，如果读到换行符则结束读取
+            while (input.hasRemaining()) {
+                byte ch = input.get();
+
+                if (ch == 3) { // ctrl+c 关闭连接
+                    state = CLOSED;
+                    return true;
+                } else if (ch == '\r') { // continue
+                } else if (ch == '\n') {
+                    // 读取到了 \r\n，读取结束
+                    return true;
+                } else {
+                    inputStringBuilder.append((char) ch);
+                }
+            }
+        } else if (bytes == -1) {
+            // -1 客户端关闭了连接
+            throw new EOFException();
+        } else {
+            // bytes == 0 继续读取
+        }
+        return false;
+    }
+
+    /**
+     * 根据业务处理结果，判断如何响应
+     *
+     * @throws EOFException 用户输入 ctrl+c 主动关闭
+     */
+    protected void process() throws EOFException {
+        // 构造用户输入内容字符串
+        String requestContent = inputStringBuilder.toString();
+        // 构造响应
+        byte[] response = requestContent.getBytes(StandardCharsets.UTF_8);
+        output.put(response);
+    }
+
+    /**
+     * 发送响应
+     */
+    protected void send() throws IOException {
+        int written = -1;
+        // 切换到读取模式，读取 output buffer，判断是否有数据要发送
+        output.flip();
+        // 如果有数据需要发送，则调用 socket.write 方法发送响应
+        if (output.hasRemaining()) {
+            written = socket.write(output);
+        }
+
+        // 检查连接是否处理完毕，是否断开连接
+        if (outputIsComplete(written)) {
+            selectionKey.channel().close();
+        } else {
+            // 否则继续读取
+            state = READING;
+            // 把提示发到界面
+            socket.write(ByteBuffer.wrap("\r\nreactor> ".getBytes()));
+            selectionKey.interestOps(SelectionKey.OP_READ);
+        }
+    }
+
+    /**
+     * 当用户输入了一个空行，表示连接可以关闭了
+     */
+    protected boolean outputIsComplete(int written) {
+        if (written <= 0) {
+            // 用户只敲了个回车， 断开连接
+            return true;
+        }
+
+        // 清空旧数据，接着处理后续的请求
+        output.clear();
+        inputStringBuilder.delete(0, inputStringBuilder.length());
+        return false;
+    }
 }
